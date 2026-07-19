@@ -1,0 +1,13 @@
+{
+  "name": "digest-worker",
+  "version": "1.0.0",
+  "description": "Accumulates leads routed to the email digest destination and sends a twice-daily branch-code-gated link to view/download them.",
+  "type": "module",
+  "main": "worker.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}
