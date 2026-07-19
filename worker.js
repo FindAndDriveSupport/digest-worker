@@ -3,21 +3,19 @@
  *
  * Fully self-contained: owns the email digest feature end to end. Nothing
  * else in the rebuilt pipeline knows or cares how this works internally —
- * queue-worker just routes "email" type destinations here and forgets
- * about them.
+ * queue-worker just calls POST /accumulate for "email" type destinations
+ * and forgets about them.
  *
  * ─────────────────────────────────────────────────────────────────────────
  * TWO SEPARATE JOBS IN ONE WORKER
  * ─────────────────────────────────────────────────────────────────────────
- * 1. QUEUE CONSUMER (digest-accumulate-queue): each message is one lead
- *    routed to an "email" destination. Appends it into a per-dealer/branch
- *    bucket in EMAIL_DIGEST KV (key "digest:{dealerKey}:{branchCode}").
- *    REQUIRES max_concurrency: 1 — this is a KV read-modify-write on a
- *    shared key, NOT a transaction. Concurrent invocations WILL race and
- *    silently drop leads — confirmed in production when this lived inside
- *    the old combined worker and Cloudflare's default autoscaling (up to
- *    ~5 concurrent invocations under backlog) caused exactly this. Moving
- *    this into its own Worker does NOT remove the need for this setting.
+ * 1. ACCUMULATION (POST /accumulate, called via Service Binding from
+ *    queue-worker — NOT a queue consumer, see note below): each call is one
+ *    lead routed to an "email" destination. Appends it into a per-dealer/
+ *    branch bucket in EMAIL_DIGEST KV (key "digest:{dealerKey}:{branchCode}").
+ *    The read-modify-write race this bucket is exposed to (see next
+ *    paragraph) is UNCHANGED by moving off queues — do not parallelize
+ *    calls into this route without addressing that properly first.
  * 2. CRON + HTTP (twice daily, 06:00 & 12:00 UTC = 08:00 & 14:00 SAST):
  *    for every dealer/branch with an "email" destination and a non-empty
  *    bucket, generates a random link token, stores { password, bucket }
@@ -28,6 +26,22 @@
  *    for the branch code; correct code issues a 15-min session token, then
  *    shows an HTML table + a "Download as Excel" button that builds the
  *    .xlsx on-demand at /digest/download.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * NO LONGER A QUEUE CONSUMER — converted to a Service Binding target
+ * ─────────────────────────────────────────────────────────────────────────
+ * Originally consumed digest-accumulate-queue with max_concurrency: 1 to
+ * guard the KV read-modify-write race above. Converted to a direct
+ * Service Binding call (queue-worker → env.DIGEST_WORKER.fetch(...))
+ * because Cloudflare Queues costs ~3 operations per message with a
+ * 10k/day budget on the free plan — per-lead traffic through queues at
+ * every hand-off in this pipeline blew well past that. See cron-worker's
+ * file header "QUEUES OPERATIONS BUDGET" note for the full numbers. The
+ * race-condition risk from concurrent writers is UNCHANGED by this move —
+ * it's mitigated today only because queue-worker calls this route
+ * sequentially per lead, not because Service Bindings are inherently safe
+ * against it. If any upstream caller ever starts firing concurrent calls
+ * here, the race returns.
  *
  * WHY A LINK INSTEAD OF AN ENCRYPTED ATTACHMENT: earlier versions attached
  * a password-protected ZIP directly. Real problems in practice — Windows'
@@ -46,21 +60,16 @@
  *   [[kv_namespaces]] binding = "LEADS_SYNC_CACHE"   (mark cacheKey done
  *     after accumulation, matching every other destination's behaviour)
  *   [[kv_namespaces]] binding = "EMAIL_DIGEST"        (buckets, links, sessions)
- *   [[queues.consumers]] queue = "digest-accumulate-queue"
- *     max_batch_size = 10, max_retries = 3, max_concurrency = 1   ← REQUIRED
- *     dead_letter_queue = "digest-accumulate-dlq"
- *   [[queues.consumers]] queue = "digest-accumulate-dlq"
- *     max_batch_size = 10, max_retries = 3
  *   [triggers] crons = ["0 6,12 * * *"]
  *   RESEND_API_KEY set as a secret (dashboard → Settings → Variables and
  *   Secrets). Optionally ALERT_FROM_EMAIL the same way (defaults to
  *   "leads@findndrive.co.za" if unset).
  *
- * MESSAGE SHAPE (produced by queue-worker, onto digest-accumulate-queue):
+ * CALL CONTRACT — POST /accumulate (from queue-worker, via Service Binding):
  *   { dealerKey, branchCode, intent, lead, cacheKey }
  *   — no `dest` needed here at all; appendToDigest never used it even in
  *     the old combined worker. recipientEmail is looked up fresh from
- *     LEADS_SYNC_CONFIG at send time instead, not carried on the message.
+ *     LEADS_SYNC_CONFIG at send time instead, not carried on the call.
  */
 
 import crypto from "node:crypto";
@@ -70,7 +79,6 @@ const SHARED_CREDENTIALS_KEY = "__shared_credentials__"; // present in LEADS_SYN
 const DONE_MARKER_TTL = 604800;           // 7 days — matches every other destination's dedup marker TTL.
 const DIGEST_LINK_TTL_SECONDS = 72000;    // 20 hours — comfortably covers the up-to-18h gap between the two daily digest runs.
 const DIGEST_SESSION_TTL_SECONDS = 900;   // 15 minutes — short-lived, only needed to bridge "code verified" → "file downloaded".
-const MAX_QUEUE_RETRIES = 3;              // keep in sync with digest-accumulate-queue's max_retries in wrangler.toml.
 const DIGEST_CRON = "0 6,12 * * *";       // must match wrangler.toml's crons array exactly.
 
 export default {
@@ -82,6 +90,22 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    if (path === "/accumulate" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+        await processAccumulateMessage(body, env);
+        return new Response("OK", { status: 200 });
+      } catch (err) {
+        const { dealerKey, branchCode, cacheKey } = body || {};
+        const label = branchCode ? `${dealerKey} [${branchCode}]` : dealerKey;
+        console.error(`❌ [digest:accumulate] Failed for ${label}: ${err.message}. Cache key: ${cacheKey}.`);
+        return new Response(JSON.stringify({ error: err.message }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
     if (path === "/run-digest") {
       await runEmailDigests(env);
       return new Response("Digest run complete", { status: 200 });
@@ -95,50 +119,26 @@ export default {
     }
     return new Response("digest-worker", { status: 200 });
   },
-
-  async queue(batch, env, ctx) {
-    if (batch.queue === "digest-accumulate-dlq") {
-      return handleDeadLetterBatch(batch);
-    }
-    return handleAccumulateBatch(batch, env);
-  },
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// QUEUE CONSUMER — accumulation
+// ACCUMULATION — called via Service Binding from queue-worker (POST /accumulate)
 // ═══════════════════════════════════════════════════════════════════════════
-
-async function handleAccumulateBatch(batch, env) {
-  for (const message of batch.messages) {
-    try {
-      await processAccumulateMessage(message.body, env);
-      message.ack();
-    } catch (err) {
-      const { dealerKey, branchCode, cacheKey } = message.body;
-      const label = branchCode ? `${dealerKey} [${branchCode}]` : dealerKey;
-      const isFinalAttempt = message.attempts > MAX_QUEUE_RETRIES;
-
-      if (isFinalAttempt) {
-        console.error(`❌ [DEAD LETTER] Digest accumulation permanently failed for ${label} after ${message.attempts} attempts. Cache key: ${cacheKey}. Reason: ${err.message}`);
-      } else {
-        console.log(`⚠️  [digest:accumulate] Attempt ${message.attempts} failed for ${cacheKey}, will retry: ${err.message}`);
-      }
-      message.retry();
-    }
-  }
-}
-
-async function handleDeadLetterBatch(batch) {
-  for (const message of batch.messages) {
-    const { dealerKey, branchCode, intent, lead, cacheKey } = message.body;
-    const label = branchCode ? `${dealerKey} [${branchCode}]` : dealerKey;
-    console.error(
-      `❌ [DEAD LETTER QUEUE] Digest accumulation for ${label} landed in DLQ. ` +
-      `Lead: ${lead.firstName} ${lead.lastName} (${lead.mobileNumber}), intent: ${intent}. Cache key: ${cacheKey}. Needs manual review.`
-    );
-    message.ack();
-  }
-}
+//
+// NO LONGER A QUEUE CONSUMER — see cron-worker's file header "QUEUES
+// OPERATIONS BUDGET" note for why every per-lead hand-off in this pipeline
+// moved from Queues to direct Service Binding calls. The max_concurrency: 1
+// requirement below is UNCHANGED and just as critical as before — moving
+// off queues doesn't remove the underlying read-modify-write race on
+// EMAIL_DIGEST, it just means Cloudflare's Queues-specific concurrency
+// scaling isn't the mechanism to worry about anymore. Since Service
+// Binding calls from queue-worker happen once per lead, sequentially
+// within queue-worker's own per-lead loop (which itself is called
+// sequentially by cron-worker per lead within a branch), concurrent calls
+// to THIS route should be naturally rare — but if queue-worker or
+// cron-worker's call pattern ever changes to fire concurrently, this race
+// returns. Worth real caution before parallelizing anything upstream of
+// this endpoint.
 
 async function processAccumulateMessage(msg, env) {
   const { dealerKey, branchCode, intent, lead, cacheKey } = msg;
