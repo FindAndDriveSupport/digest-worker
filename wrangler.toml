@@ -2,10 +2,7 @@ name = "digest-worker"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
-# NOTE: tail_consumers → alert-worker intentionally omitted for now — see
-# integration-worker's wrangler.toml for why (code 100150, Workers Paid
-# plan required for Tail Workers — check account billing status, then
-# add: tail_consumers = [{ service = "alert-worker" }]
+tail_consumers = [{ service = "alert-worker" }]
 
 # RESEND_API_KEY must be set as a secret (dashboard → digest-worker →
 # Settings → Variables and Secrets) — NOT here. ALERT_FROM_EMAIL optional
@@ -16,7 +13,7 @@ compatibility_flags = ["nodejs_compat"]
 # has no incoming request to derive the host from. Update to match
 # wherever this Worker actually ends up deployed (custom domain or the
 # workers.dev URL Cloudflare assigns on first deploy).
-WORKER_BASE_URL = "https://leads-api.findndrive.co.za"
+WORKER_BASE_URL = "https://digest-worker.findndrive.co.za"
 
 [triggers]
 # Twice daily: 06:00 & 12:00 UTC = 08:00 & 14:00 SAST (SAST = UTC+2, no DST).
@@ -34,24 +31,8 @@ id = "5bdb23b812e54e0fbd9b70dfa25cd5db"
 binding = "EMAIL_DIGEST"
 id = "58ca341f4e6b48a0b9f931af2029d7a3"
 
-# Main accumulation consumer. max_concurrency = 1 is REQUIRED — see file
-# header. This is not optional tuning; removing it WILL silently drop
-# leads under any real backlog, confirmed in production once already.
-[[queues.consumers]]
-queue = "digest-accumulate-queue"
-max_batch_size = 10
-max_batch_timeout = 30
-max_retries = 3
-max_concurrency = 1
-dead_letter_queue = "digest-accumulate-dlq"
-
-# Dead-letter consumer — backstop alerting for anything that lands here.
-[[queues.consumers]]
-queue = "digest-accumulate-dlq"
-max_batch_size = 10
-max_retries = 3
-
 [observability.logs]
 enabled = true
 invocation_logs = true
 head_sampling_rate = 0.2
+
