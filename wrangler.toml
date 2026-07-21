@@ -34,5 +34,5 @@ id = "58ca341f4e6b48a0b9f931af2029d7a3"
 [observability.logs]
 enabled = true
 invocation_logs = true
-head_sampling_rate = 1.0
+head_sampling_rate = 0.2
 
